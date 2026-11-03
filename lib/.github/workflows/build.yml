@@ -1,0 +1,59 @@
+name: Gerar APK
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Gerar a parte Android do projeto
+        run: |
+          flutter create --platforms=android --org br.com.comparador --project-name comparador /tmp/gen/app
+          cp -r /tmp/gen/app/android ./android
+
+      - name: Ajustar permissoes e versao minima do Android
+        run: |
+          MANIFEST=android/app/src/main/AndroidManifest.xml
+          sed -i 's#<application#<uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.CAMERA"/>\n    <application#' "$MANIFEST"
+          sed -i 's#android:label="[^"]*"#android:label="Comparador"#' "$MANIFEST"
+          for f in android/app/build.gradle android/app/build.gradle.kts; do
+            if [ -f "$f" ]; then sed -i 's/flutter\.minSdkVersion/24/' "$f"; fi
+          done
+          cat "$MANIFEST"
+
+      - name: Baixar dependencias
+        run: flutter pub get
+
+      - name: Compilar APK
+        run: flutter build apk --release
+
+      - name: Guardar APK (aba Actions)
+        uses: actions/upload-artifact@v4
+        with:
+          name: comparador-apk
+          path: build/app/outputs/flutter-apk/app-release.apk
+
+      - name: Publicar APK (aba Releases)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: apk-${{ github.run_number }}
+          name: Comparador APK ${{ github.run_number }}
+          files: build/app/outputs/flutter-apk/app-release.apk
