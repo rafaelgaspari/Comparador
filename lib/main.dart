@@ -45,7 +45,7 @@ class Store {
   });
 
   /// Sites em que o preço depende de CEP/loja escolhidos no próprio site.
-  bool get needsLocation => mode == 'vtex' || mode == 'generic';
+  bool get needsLocation => mode == 'vtex';
 }
 
 final List<Store> kStores = [
@@ -143,6 +143,7 @@ class Item {
   final List<String> extra;
   final String raw;
   final String? img;
+  final bool unavailable;
   late final UnitInfo? unit = unitInfo(name, price);
 
   Item({
@@ -154,6 +155,7 @@ class Item {
     this.extra = const [],
     this.raw = '',
     this.img,
+    this.unavailable = false,
   });
 
   static Item? fromJson(Store s, Map j) {
@@ -169,6 +171,7 @@ class Item {
       extra: ((j['extra'] as List?) ?? []).map((e) => e.toString()).toList(),
       raw: (j['raw'] ?? '').toString(),
       img: j['img']?.toString(),
+      unavailable: j['unavail'] == true,
     );
   }
 }
@@ -182,6 +185,7 @@ class StoreResult {
   final String? cep;
   final int ms;
   final String debug;
+  final String note;
 
   const StoreResult({
     this.phase = Phase.idle,
@@ -190,6 +194,7 @@ class StoreResult {
     this.cep,
     this.ms = 0,
     this.debug = '',
+    this.note = '',
   });
 }
 
@@ -283,6 +288,31 @@ var MODE='__MODE__';
 function norm(s){return (s||'').replace(/\s+/g,' ').trim();}
 function prices(t){var out=[],m,re=/R\$\s*(\d{1,3}(?:\.\d{3})*|\d+),(\d{2})/g;while((m=re.exec(t||''))){out.push(parseFloat(m[1].replace(/\./g,'')+'.'+m[2]));}return out;}
 function hasPrice(t){var p=prices(t);for(var i=0;i<p.length;i++){if(p[i]>0)return true;}return false;}
+function imgUrl(root){
+  var out='';
+  var imgs=root.querySelectorAll('img');
+  for(var i=0;i<imgs.length&&!out;i++){
+    var im=imgs[i];
+    try{var w=im.getBoundingClientRect().width;if(w>0&&w<30)continue;}catch(e){}
+    var c=[im.currentSrc,im.getAttribute('src'),im.getAttribute('data-src'),im.getAttribute('data-lazy-src'),im.getAttribute('data-original')];
+    var ss=im.getAttribute('srcset')||im.getAttribute('data-srcset');
+    if(ss)c.push(ss.split(',')[0].trim().split(' ')[0]);
+    for(var j=0;j<c.length&&!out;j++){
+      var v=c[j];
+      if(v&&v.indexOf('data:')!==0){try{out=new URL(v,location.href).href;}catch(e){}}
+    }
+  }
+  if(!out){
+    var so=root.querySelector('source[srcset]');
+    if(so){var v2=(so.getAttribute('srcset')||'').split(',')[0].trim().split(' ')[0];if(v2){try{out=new URL(v2,location.href).href;}catch(e){}}}
+  }
+  if(!out){
+    var bg=root.querySelector('[style*="background-image"]');
+    if(bg){var mm=(bg.getAttribute('style')||'').match(/url\(["']?([^"')]+)["']?\)/);if(mm){try{out=new URL(mm[1],location.href).href;}catch(e){}}}
+  }
+  return out;
+}
+try{[].forEach.call(document.querySelectorAll('img[loading="lazy"]'),function(i){i.loading='eager';});}catch(e){}
 function key(a){try{var u=new URL(a.href,location.href);return u.origin+u.pathname;}catch(e){return a.href;}}
 function isProd(a){
   var k=key(a);
@@ -314,6 +344,7 @@ links.forEach(function(a){
     if(!keys[kk]){keys[kk]=1;n++;}
   });
   if(n>(MODE==='generic'?2:1))return;
+  if(MODE==='generic'&&(found.textContent||'').length>500)return;
   seenEl.push(found);
   seenKey[k]=1;
 
@@ -349,10 +380,28 @@ links.forEach(function(a){
   if(!price){var ap=prices(found.textContent).filter(function(x){return x>0;});if(ap.length)price=ap[0];}
   if(!price)return;
 
+  var txt=norm(found.innerText||found.textContent);
+  var oldP=old.length?old[0].p:null;
   var extra=[],seenP=[price];
   live.forEach(function(x){
     if(seenP.indexOf(x.p)<0&&extra.length<3){seenP.push(x.p);extra.push(x.ctx);}
   });
+  function num(i,d){return parseFloat(i.replace(/\./g,'')+'.'+d);}
+  var tm=txt.match(/a partir de\s*(\d+)\s*unid\w*\.?\s*R\$\s*(\d{1,3}(?:\.\d{3})*|\d+),(\d{2})/i);
+  var um=txt.match(/ou\s*R\$\s*(\d{1,3}(?:\.\d{3})*|\d+),(\d{2})\s*\/\s*cada/i);
+  if(tm&&um&&num(um[1],um[2])>0){
+    price=num(um[1],um[2]);
+    extra=['A partir de '+tm[1]+' un: R$ '+num(tm[2],tm[3]).toFixed(2).replace('.',',')];
+    oldP=null;
+  }else if(live.length>=2&&/\d+\s*%\s*(off|de desconto)|-\s*\d+\s*%/i.test(txt)){
+    var dp=[];
+    live.forEach(function(x){if(dp.indexOf(x.p)<0)dp.push(x.p);});
+    if(dp.length>=2){
+      var lo=Math.min(dp[0],dp[1]),hi=Math.max(dp[0],dp[1]);
+      price=lo;oldP=hi;extra=[];
+    }
+  }
+  var unavail=/indispon[i\u00ed]vel|esgotad|sem estoque/i.test(txt);
 
   var name='';
   var t=found.querySelector('[data-fs-product-card-title],h1,h2,h3,h4,[class*="title" i],[class*="name" i]');
@@ -369,21 +418,22 @@ links.forEach(function(a){
     name=lines[0]||'';
   }
   if(!name)return;
-  var img=found.querySelector('img');
   items.push({
     name:name.slice(0,140),
     url:a.href,
     price:price,
-    old:old.length?old[0].p:null,
+    old:oldP,
+    unavail:unavail,
     extra:extra,
     raw:norm(found.innerText||found.textContent).slice(0,160),
-    img:img?(img.currentSrc||img.src||''):''
+    img:imgUrl(found)
   });
 });
 var m=((document.body&&document.body.innerText)||'').match(/\b\d{5}-?\d{3}\b/);
 var bodyText=(document.body&&document.body.innerText)||'';
 var noRes=/nenhum (produto|resultado)|n[ãa]o encontramos|0 produtos? encontrad/i.test(bodyText);
-return JSON.stringify({items:items,cep:m?m[0]:'',url:location.href,title:document.title,noRes:noRes,links:links.length});
+var withImg=items.filter(function(x){return x.img;}).length;
+return JSON.stringify({items:items,withImg:withImg,cep:m?m[0]:'',url:location.href,title:document.title,noRes:noRes,links:links.length});
 }catch(e){
 return JSON.stringify({items:[],err:String(e),title:'',url:'',cep:''});
 }
@@ -414,6 +464,7 @@ class ScrapeResult {
   final bool blocked;
   final bool noRes;
   final int links;
+  final int withImg;
   const ScrapeResult({
     required this.items,
     this.cep,
@@ -422,6 +473,7 @@ class ScrapeResult {
     this.blocked = false,
     this.noRes = false,
     this.links = 0,
+    this.withImg = 0,
   });
 }
 
@@ -515,6 +567,7 @@ class WebScraper {
         blocked: blockedTitle && items.isEmpty,
         noRes: d['noRes'] == true,
         links: (d['links'] as num?)?.toInt() ?? 0,
+        withImg: (d['withImg'] as num?)?.toInt() ?? 0,
       );
     } catch (_) {
       return null;
@@ -550,6 +603,92 @@ Future<String?> lookupEanName(String ean) async {
 // ---------------------------------------------------------------------------
 // App
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Relevância: esconde o que não tem relação com o que foi digitado
+// ---------------------------------------------------------------------------
+
+String _norm(String s) {
+  const from = 'áàâãäéèêëíìîïóòôõöúùûüçñ';
+  const to = 'aaaaaeeeeiiiiooooouuuucn';
+  final b = StringBuffer();
+  for (final ch in s.toLowerCase().split('')) {
+    final i = from.indexOf(ch);
+    b.write(i >= 0 ? to[i] : ch);
+  }
+  return b.toString().replaceAll(RegExp(r'[^a-z0-9]+'), ' ').trim();
+}
+
+const Set<String> _stopWords = {
+  'de', 'da', 'do', 'das', 'dos', 'com', 'e', 'para', 'a', 'o', 'em', 'un',
+  'und', 'unid', 'unidade', 'unidades', 'litro', 'litros', 'quilo', 'quilos',
+  'kg', 'g', 'gr', 'l', 'lt', 'ml',
+};
+
+bool _isCode(String q) => RegExp(r'^\d{6,}$').hasMatch(q.trim());
+
+List<String> queryTokens(String q) {
+  final seen = <String>{};
+  final out = <String>[];
+  for (final w in _norm(q).split(' ')) {
+    if (w.isEmpty || _stopWords.contains(w)) continue;
+    if (w.length < 2 && !RegExp(r'\d').hasMatch(w)) continue;
+    if (seen.add(w)) out.add(w);
+  }
+  return out;
+}
+
+double relevance(List<String> toks, String name) {
+  if (toks.isEmpty) return 1;
+  final n = _norm(name);
+  final words = n.split(' ');
+  final compact = n.replaceAll(' ', '');
+  var hit = 0;
+  for (final t in toks) {
+    bool m;
+    if (RegExp(r'\d').hasMatch(t)) {
+      m = compact.contains(t);
+    } else {
+      m = words.any((w) => w.startsWith(t) || (w.length >= 5 && t.startsWith(w)));
+      if (!m) m = t.length >= 5 && compact.contains(t); // "bom bom" no nome x "bombom"
+    }
+    if (m) hit++;
+  }
+  return hit / toks.length;
+}
+
+/// Mantém só os itens parecidos com a busca, do mais ao menos parecido.
+List<Item> filterRelevant(String q, List<Item> items) {
+  final toks = queryTokens(q);
+  if (toks.isEmpty || _isCode(q)) return List.of(items);
+  final scores = items.map((i) => relevance(toks, i.name)).toList();
+  final best = scores.fold<double>(0, (a, b) => b > a ? b : a);
+  final thr = best < 0.8 ? best : 0.8;
+  final idx = <int>[
+    for (var i = 0; i < items.length; i++)
+      if (scores[i] >= 0.5 && scores[i] >= thr) i
+  ];
+  idx.sort((a, b) {
+    final c = scores[b].compareTo(scores[a]);
+    return c != 0 ? c : a.compareTo(b);
+  });
+  return [for (final i in idx) items[i]];
+}
+
+/// "bom bom especialidades nestle" -> "bombom especialidades nestle"
+String? joinedVariant(String q) {
+  final w = _norm(q).split(' ').where((e) => e.isNotEmpty).toList();
+  if (w.length < 2) return null;
+  return [w[0] + w[1], ...w.sublist(2)].join(' ');
+}
+
+class _Fetched {
+  final List<Item> items;
+  final String? cep;
+  final Phase? forced;
+  final String msg;
+  _Fetched(this.items, this.cep, this.forced, this.msg);
+}
 
 void main() => runApp(const App());
 
@@ -592,6 +731,8 @@ class _HomePageState extends State<HomePage> {
   final Map<String, StoreResult> _results = {};
   final Set<String> _hidden = {};
   final Set<String> _expanded = {};
+  final Set<String> _showAll = {};
+  String _query = '';
   bool _ranking = false;
   int _token = 0;
   String _cep = kDefaultCep;
@@ -627,7 +768,9 @@ class _HomePageState extends State<HomePage> {
     FocusScope.of(context).unfocus();
     final token = ++_token;
     setState(() {
+      _query = q;
       _expanded.clear();
+      _showAll.clear();
       for (final s in kStores) {
         _results[s.id] = const StoreResult(phase: Phase.loading);
       }
@@ -640,47 +783,77 @@ class _HomePageState extends State<HomePage> {
     return total;
   }
 
+  List<Item> _visible(Store s) {
+    final r = _results[s.id];
+    if (r == null) return const [];
+    if (_showAll.contains(s.id)) return r.items;
+    return filterRelevant(_query, r.items);
+  }
+
+  Future<_Fetched?> _fetch(Store s, String q, int token, StringBuffer dbg) async {
+    var items = <Item>[];
+    String? cep;
+    Phase? forced;
+    var msg = '';
+    if (s.id == 'goodbom') {
+      try {
+        items = await fetchGoodBom(s, q);
+        dbg.writeln('Requisição direta: ${items.length} itens');
+      } catch (e) {
+        dbg.writeln('Requisição direta falhou: $e');
+      }
+    }
+    if (items.isEmpty) {
+      final r = await _scrapers[s.id]!.search(q);
+      if (r == null || token != _token) return null;
+      items = r.items;
+      cep = r.cep;
+      dbg.writeln('WebView: ${r.items.length} itens (${r.withImg} com foto) | '
+          'links de produto: ${r.links} | título: ${r.title} | url final: ${r.url}');
+      if (r.blocked) {
+        forced = Phase.blocked;
+        msg = 'Bloqueado pelo site (anti-robô)';
+      }
+    }
+    return _Fetched(items, cep, forced, msg);
+  }
+
   Future<void> _searchStore(Store s, String q, int token) async {
     final sw = Stopwatch()..start();
     final dbg = StringBuffer('Loja: ${s.name}\nBusca: ${s.searchUrl(q)}\n');
     try {
-      var items = <Item>[];
-      String? cep;
-      Phase? forced;
-      var msg = '';
-      if (s.id == 'goodbom') {
-        try {
-          items = await fetchGoodBom(s, q);
-          dbg.writeln('Requisição direta: ${items.length} itens');
-        } catch (e) {
-          dbg.writeln('Requisição direta falhou: $e');
-        }
-      }
-      if (items.isEmpty) {
-        final r = await _scrapers[s.id]!.search(q);
-        if (r == null || token != _token) return;
-        items = r.items;
-        cep = r.cep;
-        dbg.writeln('WebView: ${r.items.length} itens | links de produto: '
-            '${r.links} | título: ${r.title} | url final: ${r.url}');
-        if (r.blocked) {
-          forced = Phase.blocked;
-          msg = 'Bloqueado pelo site (anti-robô)';
+      var f = await _fetch(s, q, token, dbg);
+      if (f == null) return;
+      var note = '';
+      if (f.forced == null && filterRelevant(q, f.items).isEmpty) {
+        final v = joinedVariant(q);
+        if (v != null && !_isCode(q)) {
+          dbg.writeln('Nada parecido. Tentando de novo: ${s.searchUrl(v)}');
+          final f2 = await _fetch(s, v, token, dbg);
+          if (f2 == null) return;
+          if (filterRelevant(q, f2.items).isNotEmpty) {
+            f = f2;
+            note = ' · buscou "$v"';
+          }
         }
       }
       if (token != _token || !mounted) return;
       sw.stop();
-      for (final it in items.take(3)) {
+      final _Fetched fin = f;
+      dbg.writeln(
+          'Parecidos com a busca: ${filterRelevant(q, fin.items).length} de ${fin.items.length}');
+      for (final it in fin.items.take(3)) {
         dbg.writeln('• ${it.name} | ${brl(it.price)} | ${it.raw}');
       }
       setState(() {
         _results[s.id] = StoreResult(
-          phase: forced ?? (items.isEmpty ? Phase.empty : Phase.ok),
-          items: items,
-          message: msg,
-          cep: cep,
+          phase: fin.forced ?? (fin.items.isEmpty ? Phase.empty : Phase.ok),
+          items: fin.items,
+          message: fin.msg,
+          cep: fin.cep,
           ms: sw.elapsedMilliseconds,
           debug: dbg.toString(),
+          note: note,
         );
       });
     } catch (e) {
@@ -916,7 +1089,9 @@ class _HomePageState extends State<HomePage> {
             child: CircularProgressIndicator(strokeWidth: 2));
         break;
       case Phase.ok:
-        avatar = const Icon(Icons.check_circle, size: 16, color: Colors.green);
+        avatar = _visible(s).isEmpty
+            ? const Icon(Icons.remove_circle_outline, size: 16)
+            : const Icon(Icons.check_circle, size: 16, color: Colors.green);
         break;
       case Phase.empty:
         avatar = const Icon(Icons.remove_circle_outline, size: 16);
@@ -946,7 +1121,7 @@ class _HomePageState extends State<HomePage> {
       final r = _results[s.id];
       if (r == null) continue;
       if (r.phase == Phase.loading) pending = true;
-      cands.addAll(r.items.take(5));
+      cands.addAll(_visible(s).where((i) => !i.unavailable).take(5));
     }
     if (cands.isEmpty) return const SizedBox.shrink();
 
@@ -1013,26 +1188,49 @@ class _HomePageState extends State<HomePage> {
         out.add(const Padding(
             padding: EdgeInsets.symmetric(vertical: 12),
             child: LinearProgressIndicator()));
-      } else if (r.items.isNotEmpty) {
-        final expanded = _expanded.contains(s.id);
-        final shown = expanded ? r.items : r.items.take(5).toList();
-        for (final it in shown) {
-          out.add(_tile(it, showStore: false));
-        }
-        if (r.items.length > 5) {
-          out.add(TextButton(
-            onPressed: () => setState(() {
-              if (expanded) {
-                _expanded.remove(s.id);
-              } else {
-                _expanded.add(s.id);
-              }
-            }),
-            child: Text(expanded
-                ? 'Mostrar menos'
-                : 'Ver mais (${r.items.length - 5})'),
-          ));
-        }
+        continue;
+      }
+      final vis = _visible(s);
+      final hiddenCount = r.items.length - vis.length;
+      final showingAll = _showAll.contains(s.id);
+      if (vis.isEmpty && r.items.isNotEmpty) {
+        out.add(Padding(
+          padding: const EdgeInsets.symmetric(vertical: 6),
+          child: Text('Nenhum resultado parecido com "$_query".'),
+        ));
+        out.add(TextButton(
+          onPressed: () => setState(() => _showAll.add(s.id)),
+          child: Text('Mostrar os ${r.items.length} resultados sem relação'),
+        ));
+        continue;
+      }
+      final expanded = _expanded.contains(s.id);
+      final shown = expanded ? vis : vis.take(5).toList();
+      for (final it in shown) {
+        out.add(_tile(it, showStore: false));
+      }
+      if (vis.length > 5) {
+        out.add(TextButton(
+          onPressed: () => setState(() {
+            if (expanded) {
+              _expanded.remove(s.id);
+            } else {
+              _expanded.add(s.id);
+            }
+          }),
+          child: Text(expanded ? 'Mostrar menos' : 'Ver mais (${vis.length - 5})'),
+        ));
+      }
+      if (!showingAll && hiddenCount > 0) {
+        out.add(TextButton(
+          onPressed: () => setState(() => _showAll.add(s.id)),
+          child: Text('Mostrar também $hiddenCount sem relação'),
+        ));
+      } else if (showingAll) {
+        out.add(TextButton(
+          onPressed: () => setState(() => _showAll.remove(s.id)),
+          child: const Text('Ocultar resultados sem relação'),
+        ));
       }
     }
     return out;
@@ -1046,7 +1244,8 @@ class _HomePageState extends State<HomePage> {
         status = 'buscando...';
         break;
       case Phase.ok:
-        status = '${r.items.length} resultados · ${(r.ms / 1000).toStringAsFixed(1)}s';
+        status =
+            '${_visible(s).length} de ${r.items.length} parecidos · ${(r.ms / 1000).toStringAsFixed(1)}s${r.note}';
         break;
       case Phase.empty:
         status = 'nenhum resultado';
@@ -1106,7 +1305,7 @@ class _HomePageState extends State<HomePage> {
       if (_hidden.contains(s.id)) continue;
       final r = _results[s.id];
       if (r == null) continue;
-      all.addAll(r.items.take(12));
+      all.addAll(_visible(s).where((i) => !i.unavailable).take(12));
     }
     if (all.isEmpty) {
       return [
@@ -1205,6 +1404,12 @@ class _HomePageState extends State<HomePage> {
                           overflow: TextOverflow.ellipsis,
                           style: TextStyle(
                               fontSize: 12, color: cs.onSurfaceVariant)),
+                    if (it.unavailable)
+                      Text('Indisponível',
+                          style: TextStyle(
+                              fontSize: 12,
+                              fontWeight: FontWeight.w700,
+                              color: Colors.red.shade700)),
                     _deltaText(it),
                   ],
                 ),
