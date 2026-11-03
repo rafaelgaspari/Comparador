@@ -678,41 +678,116 @@ List<String> queryTokens(String q) {
   return out;
 }
 
-double relevance(List<String> toks, String name) {
-  if (toks.isEmpty) return 1;
+class _Size {
+  final double base; // em kg ou L
+  final String label;
+  const _Size(this.base, this.label);
+}
+
+final RegExp _sizeRe =
+    RegExp(r'(?:(\d+)\s*x\s*)?(\d+(?:[.,]\d+)?)\s*(kg|gr|g|ml|litros?|lt|l)\b');
+
+List<_Size> _sizesIn(String text, {bool packs = true}) {
+  final out = <_Size>[];
+  for (final m in _sizeRe.allMatches(text.toLowerCase())) {
+    final q = double.tryParse(m.group(2)!.replaceAll(',', '.'));
+    if (q == null || q <= 0) continue;
+    final u = m.group(3)!;
+    _Size conv(double v) {
+      if (u == 'kg') return _Size(v, 'kg');
+      if (u == 'g' || u == 'gr') return _Size(v / 1000, 'kg');
+      if (u == 'ml') return _Size(v / 1000, 'L');
+      return _Size(v, 'L');
+    }
+
+    out.add(conv(q));
+    if (packs && m.group(1) != null) {
+      out.add(conv(q * double.parse(m.group(1)!)));
+    }
+  }
+  return out;
+}
+
+class _Query {
+  final List<String> tokens;
+  final List<_Size> sizes;
+  final List<List<String>> joins; // [a, b, ab]
+  _Query(this.tokens, this.sizes, this.joins);
+  bool get isEmpty => tokens.isEmpty && sizes.isEmpty;
+}
+
+_Query parseQuery(String q) {
+  final sizes = _sizesIn(q, packs: false);
+  final stripped = q.toLowerCase().replaceAll(_sizeRe, ' ');
+  final raw = _norm(stripped).split(' ').where((e) => e.isNotEmpty).toList();
+  final joins = <List<String>>[
+    for (var i = 0; i + 1 < raw.length; i++)
+      [raw[i], raw[i + 1], raw[i] + raw[i + 1]]
+  ];
+  return _Query(queryTokens(stripped), sizes, joins);
+}
+
+/// Nota de 0 a 1: quanto o nome do produto bate com o que foi buscado
+/// (palavras e tamanho, ex.: 100g não bate com 29g).
+double relevance(_Query pq, String name) {
+  final total = pq.tokens.length + pq.sizes.length;
+  if (total == 0) return 1;
   final n = _norm(name);
   final words = n.split(' ');
   final compact = n.replaceAll(' ', '');
-  var hit = 0;
-  for (final t in toks) {
-    bool m;
-    if (RegExp(r'\d').hasMatch(t)) {
-      m = compact.contains(t);
-    } else {
-      m = words.any((w) => w.startsWith(t) || (w.length >= 5 && t.startsWith(w)));
-      if (!m) m = t.length >= 5 && compact.contains(t); // "bom bom" no nome x "bombom"
+  final joined = <String>{};
+  for (final j in pq.joins) {
+    if (words.contains(j[2])) {
+      joined.add(j[0]);
+      joined.add(j[1]);
     }
-    if (m) hit++;
   }
-  return hit / toks.length;
+  var hit = 0.0;
+  for (final t in pq.tokens) {
+    if (RegExp(r'\d').hasMatch(t)) {
+      if (compact.contains(t)) hit += 1;
+      continue;
+    }
+    if (joined.contains(t)) {
+      hit += 1;
+      continue;
+    }
+    var best = 0.0;
+    for (final w in words) {
+      if (w == t) {
+        best = 1;
+        break;
+      }
+      if (w.startsWith(t)) {
+        final v = t.length / w.length >= 0.5 ? 1.0 : 0.4;
+        if (v > best) best = v;
+      } else if (w.length >= 5 && t.startsWith(w)) {
+        if (best < 0.7) best = 0.7;
+      }
+    }
+    if (best == 0 && t.length >= 5 && compact.contains(t)) best = 1;
+    hit += best;
+  }
+  if (pq.sizes.isNotEmpty) {
+    final have = _sizesIn(name);
+    for (final qs in pq.sizes) {
+      final ok = have.any((h) =>
+          h.label == qs.label && (h.base - qs.base).abs() / qs.base <= 0.12);
+      if (ok) hit += 1;
+    }
+  }
+  return hit / total;
 }
 
-/// Mantém só os itens parecidos com a busca, do mais ao menos parecido.
-List<Item> filterRelevant(String q, List<Item> items) {
-  final toks = queryTokens(q);
-  if (toks.isEmpty || _isCode(q)) return List.of(items);
-  final scores = items.map((i) => relevance(toks, i.name)).toList();
-  final best = scores.fold<double>(0, (a, b) => b > a ? b : a);
-  final thr = best < 0.8 ? best : 0.8;
-  final idx = <int>[
-    for (var i = 0; i < items.length; i++)
-      if (scores[i] >= 0.5 && scores[i] >= thr) i
-  ];
-  idx.sort((a, b) {
-    final c = scores[b].compareTo(scores[a]);
-    return c != 0 ? c : a.compareTo(b);
-  });
-  return [for (final i in idx) items[i]];
+double bestRelevance(String q, List<Item> items) {
+  final pq = parseQuery(q);
+  if (pq.isEmpty || _isCode(q)) return 1;
+  var best = 0.0;
+  for (final it in items) {
+    final sc = relevance(pq, it.name);
+    if (sc > best) best = sc;
+  }
+  return best;
 }
 
 /// "bom bom especialidades nestle" -> "bombom especialidades nestle"
@@ -804,6 +879,8 @@ class _HomePageState extends State<HomePage> {
   final Set<String> _hidden = {};
   final Set<String> _expanded = {};
   final Set<String> _showAll = {};
+  final Map<Item, double> _scores = {};
+  double _globalBest = 0;
   String _query = '';
   bool _ranking = false;
   int _token = 0;
@@ -846,6 +923,7 @@ class _HomePageState extends State<HomePage> {
       for (final s in kStores) {
         _results[s.id] = const StoreResult(phase: Phase.loading);
       }
+      _recompute();
     });
     await Future.wait(kStores.map((s) => _searchStore(s, q, token)));
     var total = 0;
@@ -855,11 +933,38 @@ class _HomePageState extends State<HomePage> {
     return total;
   }
 
+  /// Recalcula a nota de cada item. O corte é global: se algum mercado tem
+  /// um item que bate 100%, itens que só batem em parte somem de todos.
+  void _recompute() {
+    final pq = parseQuery(_query);
+    final noFilter = pq.isEmpty || _isCode(_query);
+    _scores.clear();
+    var best = 0.0;
+    for (final r in _results.values) {
+      for (final it in r.items) {
+        final sc = noFilter ? 1.0 : relevance(pq, it.name);
+        _scores[it] = sc;
+        if (sc > best) best = sc;
+      }
+    }
+    _globalBest = best;
+  }
+
   List<Item> _visible(Store s) {
     final r = _results[s.id];
     if (r == null) return const [];
     if (_showAll.contains(s.id)) return r.items;
-    return filterRelevant(_query, r.items);
+    final thr = _globalBest < 0.8 ? _globalBest : 0.8;
+    final scored = <MapEntry<int, double>>[];
+    for (var i = 0; i < r.items.length; i++) {
+      final sc = _scores[r.items[i]] ?? 0.0;
+      if (sc >= 0.5 && sc >= thr - 1e-9) scored.add(MapEntry(i, sc));
+    }
+    scored.sort((a, b) {
+      final c = b.value.compareTo(a.value);
+      return c != 0 ? c : a.key.compareTo(b.key);
+    });
+    return [for (final e in scored) r.items[e.key]];
   }
 
   Future<_Fetched?> _fetch(Store s, String q, int token, StringBuffer dbg) async {
@@ -900,13 +1005,13 @@ class _HomePageState extends State<HomePage> {
       var f = await _fetch(s, q, token, dbg);
       if (f == null) return;
       var note = '';
-      if (f.forced == null && filterRelevant(q, f.items).isEmpty) {
+      if (f.forced == null && bestRelevance(q, f.items) < 0.8) {
         final v = joinedVariant(q);
         if (v != null && !_isCode(q)) {
           dbg.writeln('Nada parecido. Tentando de novo: ${s.searchUrl(v)}');
           final f2 = await _fetch(s, v, token, dbg);
           if (f2 == null) return;
-          if (filterRelevant(q, f2.items).isNotEmpty) {
+          if (bestRelevance(q, f2.items) > bestRelevance(q, f.items)) {
             f = f2;
             note = ' · buscou "$v"';
           }
@@ -916,7 +1021,7 @@ class _HomePageState extends State<HomePage> {
       sw.stop();
       final _Fetched fin = f;
       dbg.writeln(
-          'Parecidos com a busca: ${filterRelevant(q, fin.items).length} de ${fin.items.length}');
+          'Melhor semelhança com a busca: ${bestRelevance(q, fin.items).toStringAsFixed(2)} | itens: ${fin.items.length}');
       for (final it in fin.items.take(3)) {
         dbg.writeln('• ${it.name} | ${brl(it.price)} | ${it.raw}');
       }
@@ -930,6 +1035,7 @@ class _HomePageState extends State<HomePage> {
           debug: dbg.toString(),
           note: note,
         );
+        _recompute();
       });
     } catch (e) {
       if (token != _token || !mounted) return;
@@ -941,6 +1047,7 @@ class _HomePageState extends State<HomePage> {
           ms: sw.elapsedMilliseconds,
           debug: dbg.toString(),
         );
+        _recompute();
       });
     }
   }
@@ -1236,8 +1343,11 @@ class _HomePageState extends State<HomePage> {
 
     final byPrice = [...cands]..sort((a, b) => a.price.compareTo(b.price));
     final best = byPrice.first;
+    final bestName =
+        best.name.length > 42 ? '${best.name.substring(0, 42)}…' : best.name;
     final lines = <String>[
       'Menor preço: ${brl(best.price)} no ${best.store.name}',
+      bestName,
     ];
     for (final label in ['kg', 'L']) {
       final withUnit =
@@ -1274,10 +1384,11 @@ class _HomePageState extends State<HomePage> {
               Text(lines[i],
                   style: TextStyle(
                       fontSize: i == 0 ? 16 : 13,
-                      fontWeight: i == 0 ? FontWeight.w700 : FontWeight.w500)),
+                      fontWeight: i == 0 ? FontWeight.w700 : FontWeight.w500,
+                      fontStyle: i == 1 ? FontStyle.italic : FontStyle.normal)),
             const SizedBox(height: 2),
             const Text(
-              'Considera os 5 primeiros resultados de cada mercado.',
+              'Considera só os resultados parecidos com a busca (até 5 por mercado).',
               style: TextStyle(fontSize: 11),
             ),
           ],
