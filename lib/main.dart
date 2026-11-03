@@ -10,6 +10,7 @@ import 'package:mobile_scanner/mobile_scanner.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
+import 'package:wakelock_plus/wakelock_plus.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 
 // ---------------------------------------------------------------------------
@@ -837,7 +838,385 @@ class StoreLogo extends StatelessWidget {
   }
 }
 
-void main() => runApp(const App());
+double? parseMoney(String t) {
+  final v = double.tryParse(t.trim().replaceAll(',', '.'));
+  return (v == null || v <= 0) ? null : v;
+}
+
+String moneyText(double v) => v.toStringAsFixed(2).replaceAll('.', ',');
+
+String signedBrl(double v) =>
+    v < -0.004 ? '-${brl(-v)}' : brl(v < 0 ? 0.0 : v);
+
+Color savingColor(double v) =>
+    v < -0.004 ? Colors.red.shade700 : Colors.green.shade700;
+
+// ---------------------------------------------------------------------------
+// Lista de compras (uma lista por mercado, guardada no celular)
+// ---------------------------------------------------------------------------
+
+class ListEntry {
+  final String storeId;
+  final String name;
+  final String url;
+  final String? img;
+  final double price; // preço unitário no mercado
+  final double? shelf; // preço da prateleira informado na hora da pesquisa
+  int qty;
+  bool checked;
+
+  ListEntry({
+    required this.storeId,
+    required this.name,
+    required this.url,
+    required this.price,
+    this.img,
+    this.shelf,
+    this.qty = 1,
+    this.checked = false,
+  });
+
+  String get key => '$storeId|$url';
+  double get total => price * qty;
+
+  /// Economia = (prateleira - preço no mercado) x quantidade.
+  double? get saving => shelf == null ? null : (shelf! - price) * qty;
+
+  Map<String, dynamic> toJson() => {
+        'storeId': storeId,
+        'name': name,
+        'url': url,
+        'img': img,
+        'price': price,
+        'shelf': shelf,
+        'qty': qty,
+        'checked': checked,
+      };
+
+  static ListEntry? fromJson(Map j) {
+    final price = (j['price'] as num?)?.toDouble();
+    final name = j['name']?.toString();
+    final storeId = j['storeId']?.toString();
+    if (price == null || name == null || storeId == null) return null;
+    return ListEntry(
+      storeId: storeId,
+      name: name,
+      url: (j['url'] ?? '').toString(),
+      img: j['img']?.toString(),
+      price: price,
+      shelf: (j['shelf'] as num?)?.toDouble(),
+      qty: (j['qty'] as num?)?.toInt() ?? 1,
+      checked: j['checked'] == true,
+    );
+  }
+}
+
+class ShoppingList extends ChangeNotifier {
+  final List<ListEntry> entries = [];
+
+  Future<void> load() async {
+    try {
+      final p = await SharedPreferences.getInstance();
+      final raw = p.getString('shopping_list');
+      if (raw == null) return;
+      final d = jsonDecode(raw);
+      if (d is List) {
+        for (final j in d) {
+          if (j is Map) {
+            final e = ListEntry.fromJson(j);
+            if (e != null) entries.add(e);
+          }
+        }
+      }
+    } catch (_) {}
+  }
+
+  Future<void> _save() async {
+    try {
+      final p = await SharedPreferences.getInstance();
+      await p.setString(
+          'shopping_list', jsonEncode(entries.map((e) => e.toJson()).toList()));
+    } catch (_) {}
+  }
+
+  void _changed() {
+    notifyListeners();
+    _save();
+  }
+
+  ListEntry? find(String key) {
+    for (final e in entries) {
+      if (e.key == key) return e;
+    }
+    return null;
+  }
+
+  void upsert(ListEntry e) {
+    final i = entries.indexWhere((x) => x.key == e.key);
+    if (i >= 0) {
+      entries[i] = e;
+    } else {
+      entries.add(e);
+    }
+    _changed();
+  }
+
+  void setQty(ListEntry e, int q) {
+    e.qty = q < 1 ? 1 : q;
+    _changed();
+  }
+
+  void toggle(ListEntry e) {
+    e.checked = !e.checked;
+    _changed();
+  }
+
+  void remove(ListEntry e) {
+    entries.remove(e);
+    _changed();
+  }
+
+  void clearStore(String storeId) {
+    entries.removeWhere((e) => e.storeId == storeId);
+    _changed();
+  }
+
+  List<ListEntry> of(String storeId) =>
+      entries.where((e) => e.storeId == storeId).toList();
+
+  double total([String? storeId]) => entries
+      .where((e) => storeId == null || e.storeId == storeId)
+      .fold(0.0, (a, e) => a + e.total);
+
+  double saving([String? storeId]) => entries
+      .where((e) => storeId == null || e.storeId == storeId)
+      .fold(0.0, (a, e) => a + (e.saving ?? 0));
+}
+
+final ShoppingList kList = ShoppingList();
+
+class _Cmp {
+  final Store store;
+  final StoreResult result;
+  final Item? item;
+  final int others;
+  _Cmp(this.store, this.result, this.item, this.others);
+}
+
+class ListPage extends StatelessWidget {
+  const ListPage({super.key});
+
+  Future<void> _confirmClear(BuildContext context, Store s) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('Limpar a lista do ${s.name}?'),
+        content: const Text('Todos os itens deste mercado serão removidos.'),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Cancelar')),
+          FilledButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('Limpar')),
+        ],
+      ),
+    );
+    if (ok == true) kList.clearStore(s.id);
+  }
+
+  Widget _entryTile(BuildContext context, ListEntry e) {
+    final cs = Theme.of(context).colorScheme;
+    final sv = e.saving;
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 10),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Checkbox(value: e.checked, onChanged: (_) => kList.toggle(e)),
+              Expanded(
+                child: InkWell(
+                  onTap: () => launchUrl(Uri.parse(e.url),
+                      mode: LaunchMode.externalApplication),
+                  child: Padding(
+                    padding: const EdgeInsets.only(top: 10),
+                    child: Text(
+                      e.name,
+                      maxLines: 3,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 15,
+                        decoration:
+                            e.checked ? TextDecoration.lineThrough : null,
+                        color: e.checked ? cs.onSurfaceVariant : null,
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+          Padding(
+            padding: const EdgeInsets.only(left: 48),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('${e.qty} × ${brl(e.price)} = ${brl(e.total)}'),
+                if (sv == null)
+                  Text('Sem preço da prateleira',
+                      style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant))
+                else
+                  Text(
+                    'Prateleira ${brl(e.shelf!)} → economia ${signedBrl(sv)}',
+                    style: TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
+                        color: savingColor(sv)),
+                  ),
+                Row(
+                  children: [
+                    IconButton(
+                        visualDensity: VisualDensity.compact,
+                        onPressed:
+                            e.qty > 1 ? () => kList.setQty(e, e.qty - 1) : null,
+                        icon: const Icon(Icons.remove_circle_outline)),
+                    Text('${e.qty}',
+                        style: const TextStyle(
+                            fontSize: 16, fontWeight: FontWeight.w700)),
+                    IconButton(
+                        visualDensity: VisualDensity.compact,
+                        onPressed: () => kList.setQty(e, e.qty + 1),
+                        icon: const Icon(Icons.add_circle_outline)),
+                    const Spacer(),
+                    IconButton(
+                        visualDensity: VisualDensity.compact,
+                        tooltip: 'Remover',
+                        onPressed: () => kList.remove(e),
+                        icon: const Icon(Icons.delete_outline)),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  List<Widget> _storeBlock(BuildContext context, Store s) {
+    final items = kList.of(s.id);
+    if (items.isEmpty) return const [];
+    final sv = kList.saving(s.id);
+    return [
+      Card(
+        margin: const EdgeInsets.only(top: 12),
+        child: Padding(
+          padding: const EdgeInsets.all(12),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  StoreLogo(store: s, size: 34),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Text(s.name,
+                        style: const TextStyle(
+                            fontSize: 18, fontWeight: FontWeight.w700)),
+                  ),
+                  Text('${items.length} ${items.length == 1 ? 'item' : 'itens'}'),
+                ],
+              ),
+              const SizedBox(height: 6),
+              Text('Total neste mercado: ${brl(kList.total(s.id))}'),
+              Text('Economia neste mercado: ${signedBrl(sv)}',
+                  style: TextStyle(
+                      fontWeight: FontWeight.w700, color: savingColor(sv))),
+              const Divider(height: 20),
+              for (final e in items) _entryTile(context, e),
+              Align(
+                alignment: Alignment.centerRight,
+                child: TextButton.icon(
+                  onPressed: () => _confirmClear(context, s),
+                  icon: const Icon(Icons.delete_outline),
+                  label: const Text('Limpar este mercado'),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    ];
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Lista de compras')),
+      body: ListenableBuilder(
+        listenable: kList,
+        builder: (context, _) {
+          if (kList.entries.isEmpty) {
+            return const Center(
+              child: Padding(
+                padding: EdgeInsets.all(32),
+                child: Text(
+                  'Sua lista está vazia. Busque um produto e toque no mercado mais barato para adicioná-lo à lista daquele mercado.',
+                  textAlign: TextAlign.center,
+                ),
+              ),
+            );
+          }
+          final noShelf = kList.entries.where((e) => e.shelf == null).length;
+          final totalSaving = kList.saving();
+          return ListView(
+            padding: const EdgeInsets.all(12),
+            children: [
+              Card(
+                child: Padding(
+                  padding: const EdgeInsets.all(14),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text('Economia total da lista',
+                          style: TextStyle(fontSize: 13)),
+                      Text(signedBrl(totalSaving),
+                          style: TextStyle(
+                              fontSize: 32,
+                              fontWeight: FontWeight.w800,
+                              color: savingColor(totalSaving))),
+                      const SizedBox(height: 4),
+                      Text(
+                          'Total a pagar: ${brl(kList.total())} · ${kList.entries.length} itens'),
+                      if (noShelf > 0)
+                        Padding(
+                          padding: const EdgeInsets.only(top: 6),
+                          child: Text(
+                            '$noShelf item(ns) sem preço da prateleira: não entram na economia.',
+                            style: const TextStyle(fontSize: 12),
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+              ),
+              for (final s in kStores) ..._storeBlock(context, s),
+            ],
+          );
+        },
+      ),
+    );
+  }
+}
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await kList.load();
+  runApp(const App());
+}
 
 class App extends StatelessWidget {
   const App({super.key});
@@ -882,13 +1261,17 @@ class _HomePageState extends State<HomePage> {
   final Map<Item, double> _scores = {};
   double _globalBest = 0;
   String _query = '';
-  bool _ranking = false;
+  int _view = 0; // 0 comparar, 1 por mercado, 2 ranking
+  String? _scanCode;
+  String? _scanName;
+  bool _autoScan = false;
   int _token = 0;
   String _cep = kDefaultCep;
 
   @override
   void initState() {
     super.initState();
+    WakelockPlus.enable(); // tela acesa enquanto o app está aberto
     _loadCep();
   }
 
@@ -896,6 +1279,7 @@ class _HomePageState extends State<HomePage> {
   void dispose() {
     _q.dispose();
     _shelf.dispose();
+    WakelockPlus.disable();
     super.dispose();
   }
 
@@ -1083,11 +1467,18 @@ class _HomePageState extends State<HomePage> {
     final code = await Navigator.of(context)
         .push<String>(MaterialPageRoute(builder: (_) => const ScanPage()));
     if (code == null || !mounted) return;
+    setState(() {
+      _scanCode = code;
+      _scanName = null;
+      _view = 0;
+    });
     _q.text = code;
+    final nameFuture = lookupEanName(code);
     final total = await _search(code);
-    if (total == 0 && mounted) {
-      final name = await lookupEanName(code);
-      if (!mounted) return;
+    final name = await nameFuture;
+    if (!mounted) return;
+    setState(() => _scanName = name);
+    if (total == 0) {
       if (name != null) {
         ScaffoldMessenger.of(context).showSnackBar(SnackBar(
             content: Text('Código sem resultado. Buscando por nome: $name')));
@@ -1120,12 +1511,166 @@ class _HomePageState extends State<HomePage> {
 
   // ----------------------------- UI --------------------------------------
 
+  void _submit() {
+    setState(() {
+      _scanCode = null;
+      _scanName = null;
+    });
+    _search();
+  }
+
+  void _openList() {
+    Navigator.of(context)
+        .push(MaterialPageRoute(builder: (_) => const ListPage()));
+  }
+
+  String? _guessName() {
+    for (final s in kStores) {
+      final v = _visible(s).where((i) => !i.unavailable);
+      if (v.isNotEmpty) return v.first.name;
+    }
+    return null;
+  }
+
+  /// Janela de quantidade: confirma e adiciona o produto na lista do mercado.
+  Future<void> _addToList(Item it) async {
+    final existing = kList.find('${it.store.id}|${it.url}');
+    var qty = existing?.qty ?? 1;
+    var auto = _autoScan;
+    final prefill = (existing != null && existing.shelf != null)
+        ? moneyText(existing.shelf!)
+        : _shelf.text.trim();
+    final shelfC = TextEditingController(text: prefill);
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setD) {
+          final shelf = parseMoney(shelfC.text);
+          final saving = shelf == null ? null : (shelf - it.price) * qty;
+          return AlertDialog(
+            title: Text(existing == null
+                ? 'Adicionar à lista — ${it.store.name}'
+                : 'Já está na lista — atualizar'),
+            content: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(it.name,
+                      maxLines: 3,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(fontWeight: FontWeight.w600)),
+                  const SizedBox(height: 4),
+                  Text('${brl(it.price)} no ${it.store.name}'),
+                  const SizedBox(height: 12),
+                  Row(
+                    children: [
+                      const Text('Quantidade'),
+                      const Spacer(),
+                      IconButton(
+                          onPressed: qty > 1 ? () => setD(() => qty--) : null,
+                          icon: const Icon(Icons.remove_circle_outline)),
+                      Text('$qty',
+                          style: const TextStyle(
+                              fontSize: 20, fontWeight: FontWeight.w700)),
+                      IconButton(
+                          onPressed: () => setD(() => qty++),
+                          icon: const Icon(Icons.add_circle_outline)),
+                    ],
+                  ),
+                  TextField(
+                    controller: shelfC,
+                    keyboardType:
+                        const TextInputType.numberWithOptions(decimal: true),
+                    onChanged: (_) => setD(() {}),
+                    decoration: const InputDecoration(
+                      labelText: 'Preço na prateleira (opcional)',
+                      prefixText: 'R\$ ',
+                      border: OutlineInputBorder(),
+                      isDense: true,
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  Text('Total: ${brl(it.price * qty)}'),
+                  if (saving == null)
+                    const Text(
+                        'Informe o preço da prateleira para calcular a economia.',
+                        style: TextStyle(fontSize: 12))
+                  else
+                    Text(
+                      saving >= 0
+                          ? 'Economia: ${brl(saving)}'
+                          : 'Mais caro que a prateleira: ${brl(-saving)}',
+                      style: TextStyle(
+                          fontWeight: FontWeight.w700,
+                          color: savingColor(saving)),
+                    ),
+                  CheckboxListTile(
+                    dense: true,
+                    contentPadding: EdgeInsets.zero,
+                    controlAffinity: ListTileControlAffinity.leading,
+                    value: auto,
+                    onChanged: (v) => setD(() => auto = v ?? false),
+                    title: const Text('Escanear o próximo depois de adicionar',
+                        style: TextStyle(fontSize: 13)),
+                  ),
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(
+                  onPressed: () => Navigator.pop(ctx, false),
+                  child: const Text('Cancelar')),
+              FilledButton(
+                  onPressed: () => Navigator.pop(ctx, true),
+                  child: Text(existing == null ? 'Adicionar' : 'Atualizar')),
+            ],
+          );
+        },
+      ),
+    );
+    if (ok != true) return;
+    kList.upsert(ListEntry(
+      storeId: it.store.id,
+      name: it.name,
+      url: it.url,
+      img: it.img,
+      price: it.price,
+      shelf: parseMoney(shelfC.text),
+      qty: qty,
+      checked: existing?.checked ?? false,
+    ));
+    HapticFeedback.mediumImpact();
+    _autoScan = auto;
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: Text(
+          '${existing == null ? 'Adicionado à' : 'Atualizada a'} lista do ${it.store.name}'),
+      action: SnackBarAction(label: 'Ver lista', onPressed: _openList),
+    ));
+    if (auto) await _scan();
+  }
+
+  // ----------------------------- UI --------------------------------------
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Comparador de preços'),
+        title: const Text('Comparador'),
         actions: [
+          ListenableBuilder(
+            listenable: kList,
+            builder: (context, _) => IconButton(
+              tooltip: 'Lista de compras',
+              icon: Badge(
+                isLabelVisible: kList.entries.isNotEmpty,
+                label: Text('${kList.entries.length}'),
+                child: const Icon(Icons.shopping_cart_outlined),
+              ),
+              onPressed: _openList,
+            ),
+          ),
           IconButton(
               tooltip: 'Diagnóstico',
               icon: const Icon(Icons.bug_report_outlined),
@@ -1147,8 +1692,9 @@ class _HomePageState extends State<HomePage> {
               color: Theme.of(context).scaffoldBackgroundColor,
               child: Column(
                 children: [
-                  Expanded(child: _content()),
                   _searchBar(),
+                  _shelfField(),
+                  Expanded(child: _content()),
                 ],
               ),
             ),
@@ -1159,40 +1705,93 @@ class _HomePageState extends State<HomePage> {
   }
 
   Widget _searchBar() {
-    return Material(
-      elevation: 8,
-      child: SafeArea(
-        top: false,
-        child: Padding(
-          padding: const EdgeInsets.all(8),
-          child: Row(
-            children: [
-              IconButton.filledTonal(
-                  tooltip: 'Escanear código de barras',
-                  iconSize: 28,
-                  onPressed: _scan,
-                  icon: const Icon(Icons.qr_code_scanner)),
-              const SizedBox(width: 8),
-              Expanded(
-                child: TextField(
-                  controller: _q,
-                  textInputAction: TextInputAction.search,
-                  onSubmitted: (_) => _search(),
-                  decoration: const InputDecoration(
-                    hintText: 'Produto ou código de barras',
-                    border: OutlineInputBorder(),
-                    isDense: true,
-                  ),
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(8, 8, 8, 0),
+      child: Row(
+        children: [
+          IconButton.filled(
+              tooltip: 'Escanear código de barras',
+              iconSize: 30,
+              onPressed: _scan,
+              icon: const Icon(Icons.qr_code_scanner)),
+          const SizedBox(width: 8),
+          Expanded(
+            child: TextField(
+              controller: _q,
+              textInputAction: TextInputAction.search,
+              onSubmitted: (_) => _submit(),
+              decoration: InputDecoration(
+                hintText: 'Produto ou código de barras',
+                border: const OutlineInputBorder(),
+                isDense: true,
+                suffixIcon: IconButton(
+                    tooltip: 'Limpar',
+                    icon: const Icon(Icons.clear),
+                    onPressed: () => _q.clear()),
+              ),
+            ),
+          ),
+          const SizedBox(width: 8),
+          IconButton.filledTonal(
+              tooltip: 'Buscar',
+              iconSize: 28,
+              onPressed: _submit,
+              icon: const Icon(Icons.search)),
+        ],
+      ),
+    );
+  }
+
+  Widget _shelfField() {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(8, 8, 8, 0),
+      child: TextField(
+        controller: _shelf,
+        keyboardType: const TextInputType.numberWithOptions(decimal: true),
+        onChanged: (_) => setState(() {}),
+        decoration: const InputDecoration(
+          labelText: 'Preço na prateleira de onde você está (opcional)',
+          prefixText: 'R\$ ',
+          border: OutlineInputBorder(),
+          isDense: true,
+        ),
+      ),
+    );
+  }
+
+  Widget _productHeader() {
+    final cs = Theme.of(context).colorScheme;
+    final scanning = _scanCode != null;
+    final title =
+        scanning ? (_scanName ?? _guessName() ?? 'Código $_scanCode') : _query;
+    final sub = scanning
+        ? 'Código lido: $_scanCode${_scanName == null ? ' · nome estimado pelos resultados' : ''}'
+        : 'Resultados para a sua busca';
+    return Card(
+      color: cs.secondaryContainer,
+      margin: const EdgeInsets.only(bottom: 8),
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(sub, style: const TextStyle(fontSize: 12)),
+            const SizedBox(height: 2),
+            Text(title,
+                style: const TextStyle(fontSize: 17, fontWeight: FontWeight.w700)),
+            if (scanning && _scanName != null && _scanName != _query)
+              Align(
+                alignment: Alignment.centerLeft,
+                child: TextButton.icon(
+                  onPressed: () {
+                    _q.text = _scanName!;
+                    _search(_scanName);
+                  },
+                  icon: const Icon(Icons.search, size: 18),
+                  label: const Text('Buscar pelo nome'),
                 ),
               ),
-              const SizedBox(width: 8),
-              IconButton.filled(
-                  tooltip: 'Buscar',
-                  iconSize: 28,
-                  onPressed: () => _search(),
-                  icon: const Icon(Icons.search)),
-            ],
-          ),
+          ],
         ),
       ),
     );
@@ -1200,80 +1799,338 @@ class _HomePageState extends State<HomePage> {
 
   Widget _content() {
     final cs = Theme.of(context).colorScheme;
-    final shelfField = Padding(
-      padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
-      child: TextField(
-        controller: _shelf,
-        keyboardType: const TextInputType.numberWithOptions(decimal: true),
-        onChanged: (_) => setState(() {}),
-        decoration: const InputDecoration(
-          labelText: 'Preço na prateleira (opcional)',
-          prefixText: 'R\$ ',
-          border: OutlineInputBorder(),
-          isDense: true,
-        ),
-      ),
-    );
-
     if (_results.isEmpty) {
-      return Column(
-        children: [
-          shelfField,
-          Expanded(
-            child: Center(
-              child: Padding(
-                padding: const EdgeInsets.all(32),
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Icon(Icons.shopping_cart_outlined,
-                        size: 64, color: cs.outline),
-                    const SizedBox(height: 12),
-                    Text(
-                      'Escaneie o código de barras ou digite o nome do produto para comparar Good Bom, Tenda, Atacadão e Pague Menos.',
-                      textAlign: TextAlign.center,
-                      style: TextStyle(color: cs.onSurfaceVariant),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-          ),
-        ],
-      );
-    }
-
-    return Column(
-      children: [
-        shelfField,
-        Expanded(
-          child: ListView(
-            padding: const EdgeInsets.fromLTRB(12, 8, 12, 12),
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(32),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
             children: [
-              _statusChips(),
-              _summary(),
-              Row(
-                children: [
-                  const Text('Visualização:'),
-                  const SizedBox(width: 8),
-                  SegmentedButton<bool>(
-                    showSelectedIcon: false,
-                    segments: const [
-                      ButtonSegment(value: false, label: Text('Por mercado')),
-                      ButtonSegment(value: true, label: Text('Ranking')),
-                    ],
-                    selected: {_ranking},
-                    onSelectionChanged: (v) =>
-                        setState(() => _ranking = v.first),
-                  ),
-                ],
+              Icon(Icons.shopping_cart_outlined, size: 64, color: cs.outline),
+              const SizedBox(height: 12),
+              Text(
+                'Escaneie o código de barras ou digite o nome do produto para comparar Good Bom, Tenda, Atacadão e Pague Menos.',
+                textAlign: TextAlign.center,
+                style: TextStyle(color: cs.onSurfaceVariant),
               ),
-              const SizedBox(height: 8),
-              if (_ranking) ..._rankingList() else ..._storeSections(),
             ],
           ),
         ),
+      );
+    }
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(12, 8, 12, 24),
+      children: [
+        _productHeader(),
+        SegmentedButton<int>(
+          showSelectedIcon: false,
+          segments: const [
+            ButtonSegment(value: 0, label: Text('Comparar')),
+            ButtonSegment(value: 1, label: Text('Por mercado')),
+            ButtonSegment(value: 2, label: Text('Ranking')),
+          ],
+          selected: {_view},
+          onSelectionChanged: (v) => setState(() => _view = v.first),
+        ),
+        const SizedBox(height: 4),
+        _statusChips(),
+        if (_view != 0) _summary(),
+        if (_view == 2)
+          ..._rankingList()
+        else if (_view == 1)
+          ..._storeSections()
+        else
+          ..._compareRows(),
       ],
+    );
+  }
+
+  Widget _badge(String t, Color c) => Container(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+        decoration:
+            BoxDecoration(color: c, borderRadius: BorderRadius.circular(8)),
+        child: Text(t,
+            style: const TextStyle(
+                color: Colors.white, fontSize: 11, fontWeight: FontWeight.w700)),
+      );
+
+  /// Modo "Comparar": uma linha por mercado com o melhor resultado de cada um.
+  List<Widget> _compareRows() {
+    final cmps = <_Cmp>[];
+    for (final s in kStores) {
+      if (_hidden.contains(s.id)) continue;
+      final r = _results[s.id];
+      if (r == null) continue;
+      Item? best;
+      var others = 0;
+      if (r.phase == Phase.ok) {
+        final vis = _visible(s);
+        final avail = vis.where((i) => !i.unavailable).toList();
+        if (avail.isNotEmpty) {
+          best = avail.first;
+          others = vis.length - 1;
+        } else if (vis.isNotEmpty) {
+          best = vis.first;
+          others = vis.length - 1;
+        }
+      }
+      cmps.add(_Cmp(s, r, best, others));
+    }
+    int group(_Cmp c) {
+      final it = c.item;
+      if (it == null) return 2;
+      return it.unavailable ? 1 : 0;
+    }
+
+    cmps.sort((a, b) {
+      final ga = group(a);
+      final gb = group(b);
+      if (ga != gb) return ga.compareTo(gb);
+      if (ga == 0) return a.item!.price.compareTo(b.item!.price);
+      return 0;
+    });
+
+    final avail = cmps.where((c) => group(c) == 0).toList();
+    double? minPrice;
+    double? minUnit;
+    String? unitLabel;
+    if (avail.length >= 2) {
+      minPrice = avail.map((c) => c.item!.price).reduce((a, b) => a < b ? a : b);
+      for (final c in avail) {
+        final u = c.item!.unit;
+        if (u != null) {
+          unitLabel = u.label;
+          break;
+        }
+      }
+      if (unitLabel != null) {
+        final us = avail
+            .where((c) => c.item!.unit?.label == unitLabel)
+            .map((c) => c.item!.unit!.value)
+            .toList();
+        if (us.length >= 2) minUnit = us.reduce((a, b) => a < b ? a : b);
+      }
+    }
+
+    final out = <Widget>[];
+    for (final c in cmps) {
+      final it = c.item;
+      if (it == null) {
+        out.add(_statusCard(c));
+        continue;
+      }
+      final isAvail = group(c) == 0;
+      final cheapPrice =
+          isAvail && minPrice != null && (it.price - minPrice).abs() < 0.005;
+      final cheapUnit = isAvail &&
+          minUnit != null &&
+          it.unit != null &&
+          it.unit!.label == unitLabel &&
+          (it.unit!.value - minUnit).abs() < 0.005;
+      out.add(_cmpCard(c, it, cheapPrice, cheapUnit));
+    }
+    return out;
+  }
+
+  Widget _statusCard(_Cmp c) {
+    final cs = Theme.of(context).colorScheme;
+    final r = c.result;
+    String text;
+    switch (r.phase) {
+      case Phase.loading:
+        text = 'buscando...';
+        break;
+      case Phase.empty:
+        text = 'não encontrou resultados';
+        break;
+      case Phase.blocked:
+        text = r.message;
+        break;
+      case Phase.error:
+        text = 'indisponível: ${r.message}';
+        break;
+      case Phase.ok:
+        text = r.items.isEmpty
+            ? 'não encontrou resultados'
+            : 'nenhum resultado parecido com a busca';
+        break;
+      default:
+        text = '';
+    }
+    return Card(
+      margin: const EdgeInsets.symmetric(vertical: 5),
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          children: [
+            Row(
+              children: [
+                StoreLogo(store: c.store, size: 28),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(c.store.name,
+                          style: const TextStyle(
+                              fontSize: 16, fontWeight: FontWeight.w700)),
+                      Text(text,
+                          style: TextStyle(
+                              fontSize: 12, color: cs.onSurfaceVariant)),
+                    ],
+                  ),
+                ),
+                if (r.phase == Phase.loading)
+                  const SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(strokeWidth: 2)),
+              ],
+            ),
+            if (r.phase == Phase.ok && r.items.isNotEmpty)
+              Align(
+                alignment: Alignment.centerRight,
+                child: TextButton(
+                  onPressed: () => setState(() => _showAll.add(c.store.id)),
+                  child: Text('Mostrar os ${r.items.length} resultados mesmo assim'),
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _cmpCard(_Cmp c, Item it, bool cheapPrice, bool cheapUnit) {
+    final cs = Theme.of(context).colorScheme;
+    final highlight = cheapPrice || cheapUnit;
+    return Card(
+      margin: const EdgeInsets.symmetric(vertical: 5),
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(14),
+        side: BorderSide(
+            color: highlight ? Colors.green.shade600 : Colors.transparent,
+            width: 2),
+      ),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(14),
+        onTap: () => _addToList(it),
+        child: Padding(
+          padding: const EdgeInsets.all(12),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  StoreLogo(store: c.store, size: 28),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(c.store.name,
+                        style: const TextStyle(
+                            fontSize: 16, fontWeight: FontWeight.w700)),
+                  ),
+                ],
+              ),
+              if (highlight)
+                Padding(
+                  padding: const EdgeInsets.only(top: 6),
+                  child: Wrap(
+                    spacing: 6,
+                    children: [
+                      if (cheapPrice) _badge('Menor preço', Colors.green.shade700),
+                      if (cheapUnit)
+                        _badge('Menor R\$/${it.unit!.label}',
+                            Colors.teal.shade700),
+                    ],
+                  ),
+                ),
+              const SizedBox(height: 8),
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  if (it.img != null && it.img!.startsWith('http'))
+                    Padding(
+                      padding: const EdgeInsets.only(right: 10),
+                      child: Image.network(
+                        it.img!,
+                        width: 64,
+                        height: 64,
+                        fit: BoxFit.contain,
+                        errorBuilder: (_, __, ___) =>
+                            const SizedBox(width: 64, height: 64),
+                      ),
+                    ),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(it.name,
+                            maxLines: 3,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(fontSize: 14)),
+                        for (final e in it.extra)
+                          Text(e,
+                              maxLines: 2,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                  fontSize: 12, color: cs.onSurfaceVariant)),
+                        if (it.unavailable)
+                          Text('Indisponível',
+                              style: TextStyle(
+                                  fontSize: 12,
+                                  fontWeight: FontWeight.w700,
+                                  color: Colors.red.shade700)),
+                        _deltaText(it),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Column(
+                    crossAxisAlignment: CrossAxisAlignment.end,
+                    children: [
+                      Text(brl(it.price),
+                          style: const TextStyle(
+                              fontSize: 26, fontWeight: FontWeight.w800)),
+                      if (it.oldPrice != null && it.oldPrice! > it.price)
+                        Text(brl(it.oldPrice!),
+                            style: TextStyle(
+                                fontSize: 12,
+                                decoration: TextDecoration.lineThrough,
+                                color: cs.onSurfaceVariant)),
+                      if (it.unit != null)
+                        Text('${brl(it.unit!.value)}/${it.unit!.label}',
+                            style: TextStyle(
+                                fontSize: 13,
+                                fontWeight: FontWeight.w600,
+                                color: cs.primary)),
+                    ],
+                  ),
+                ],
+              ),
+              Align(
+                alignment: Alignment.centerRight,
+                child: Wrap(
+                  spacing: 4,
+                  children: [
+                    if (c.others > 0)
+                      TextButton(
+                          onPressed: () => setState(() => _view = 1),
+                          child: Text('+${c.others} parecidos')),
+                    TextButton.icon(
+                        onPressed: () => _open(it.url),
+                        icon: const Icon(Icons.open_in_new, size: 18),
+                        label: const Text('Site')),
+                    FilledButton.tonalIcon(
+                        onPressed: () => _addToList(it),
+                        icon: const Icon(Icons.add_shopping_cart, size: 18),
+                        label: const Text('Lista')),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
     );
   }
 
@@ -1580,7 +2437,7 @@ class _HomePageState extends State<HomePage> {
       margin: const EdgeInsets.symmetric(vertical: 4),
       child: InkWell(
         borderRadius: BorderRadius.circular(12),
-        onTap: () => _open(it.url),
+        onTap: () => _addToList(it),
         child: Padding(
           padding: const EdgeInsets.all(10),
           child: Row(
@@ -1649,7 +2506,7 @@ class _HomePageState extends State<HomePage> {
                 children: [
                   Text(brl(it.price),
                       style: const TextStyle(
-                          fontSize: 18, fontWeight: FontWeight.w700)),
+                          fontSize: 22, fontWeight: FontWeight.w800)),
                   if (it.oldPrice != null && it.oldPrice! > it.price)
                     Text(brl(it.oldPrice!),
                         style: TextStyle(
@@ -1662,6 +2519,23 @@ class _HomePageState extends State<HomePage> {
                             fontSize: 12,
                             fontWeight: FontWeight.w600,
                             color: cs.primary)),
+                  Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      IconButton(
+                          visualDensity: VisualDensity.compact,
+                          tooltip: 'Abrir no site',
+                          iconSize: 20,
+                          onPressed: () => _open(it.url),
+                          icon: const Icon(Icons.open_in_new)),
+                      IconButton(
+                          visualDensity: VisualDensity.compact,
+                          tooltip: 'Adicionar à lista',
+                          iconSize: 22,
+                          onPressed: () => _addToList(it),
+                          icon: const Icon(Icons.add_shopping_cart)),
+                    ],
+                  ),
                 ],
               ),
             ],
@@ -1751,6 +2625,7 @@ class _ScanPageState extends State<ScanPage> {
             final v = b.rawValue;
             if (v != null && v.isNotEmpty) {
               _done = true;
+              HapticFeedback.mediumImpact();
               Navigator.of(context).pop(v);
               break;
             }
