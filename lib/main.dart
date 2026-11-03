@@ -7,6 +7,7 @@ import 'package:html/dom.dart' as dom;
 import 'package:html/parser.dart' as html_parser;
 import 'package:http/http.dart' as http;
 import 'package:mobile_scanner/mobile_scanner.dart';
+import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:webview_flutter/webview_flutter.dart';
@@ -46,6 +47,10 @@ class Store {
 
   /// Sites em que o preço depende de CEP/loja escolhidos no próprio site.
   bool get needsLocation => mode == 'vtex';
+
+  /// Ícone do site (favicon), servido pelo Google.
+  String get logoUrl =>
+      'https://www.google.com/s2/favicons?domain=${Uri.parse(home).host}&sz=128';
 }
 
 final List<Store> kStores = [
@@ -312,6 +317,28 @@ function imgUrl(root){
   }
   return out;
 }
+function cardImg(found){
+  var u=imgUrl(found);
+  var up=found.parentElement;
+  for(var i=0;!u&&i<3&&up&&up!==document.body;i++){
+    var ks={},n=0;
+    [].forEach.call(up.querySelectorAll('a[href]'),function(x){if(!isProd(x))return;var kk=key(x);if(!ks[kk]){ks[kk]=1;n++;}});
+    if(n>1)break;
+    u=imgUrl(up);
+    up=up.parentElement;
+  }
+  if(!u){
+    var els=found.querySelectorAll('*');
+    for(var j=0;j<els.length&&!u;j++){
+      try{
+        var bi=getComputedStyle(els[j]).backgroundImage;
+        var mm=bi&&bi.match(/url\(["']?([^"')]+)["']?\)/);
+        if(mm&&mm[1].indexOf('data:')!==0)u=new URL(mm[1],location.href).href;
+      }catch(e){}
+    }
+  }
+  return u;
+}
 try{[].forEach.call(document.querySelectorAll('img[loading="lazy"]'),function(i){i.loading='eager';});}catch(e){}
 function key(a){try{var u=new URL(a.href,location.href);return u.origin+u.pathname;}catch(e){return a.href;}}
 function isProd(a){
@@ -326,7 +353,7 @@ var links=[].slice.call(document.querySelectorAll('a[href]')).filter(function(a)
   if(a.closest&&a.closest('header,nav,footer'))return false;
   return isProd(a);
 });
-var items=[],seenEl=[],seenKey={};
+var items=[],seenEl=[],seenKey={},sample='';
 links.forEach(function(a){
   if(items.length>=40)return;
   var k=key(a);
@@ -401,6 +428,14 @@ links.forEach(function(a){
       price=lo;oldP=hi;extra=[];
     }
   }
+  var fmt=function(v){return v.toFixed(2).replace('.',',');};
+  var cm=txt.match(/cart[a\u00e3]o\s*tenda\s*R\$\s*(\d{1,3}(?:\.\d{3})*|\d+),(\d{2})/i);
+  var qm=txt.match(/a partir de\s*(\d+)\s*unidades?\s*R\$\s*(\d{1,3}(?:\.\d{3})*|\d+),(\d{2})/i);
+  if((cm||qm)&&!(tm&&um)){
+    extra=[];
+    if(cm)extra.push('No Cart\u00e3o Tenda: R$ '+fmt(num(cm[1],cm[2])));
+    if(qm)extra.push('A partir de '+qm[1]+' un: R$ '+fmt(num(qm[2],qm[3])));
+  }
   var unavail=/indispon[i\u00ed]vel|esgotad|sem estoque/i.test(txt);
 
   var name='';
@@ -418,6 +453,8 @@ links.forEach(function(a){
     name=lines[0]||'';
   }
   if(!name)return;
+  var im=cardImg(found);
+  if(!items.length&&!im){sample=(found.parentElement||found).outerHTML.replace(/<svg[\s\S]*?<\/svg>/gi,'<svg/>').replace(/\s+/g,' ').slice(0,1500);}
   items.push({
     name:name.slice(0,140),
     url:a.href,
@@ -426,14 +463,14 @@ links.forEach(function(a){
     unavail:unavail,
     extra:extra,
     raw:norm(found.innerText||found.textContent).slice(0,160),
-    img:imgUrl(found)
+    img:im
   });
 });
 var m=((document.body&&document.body.innerText)||'').match(/\b\d{5}-?\d{3}\b/);
 var bodyText=(document.body&&document.body.innerText)||'';
 var noRes=/nenhum (produto|resultado)|n[ãa]o encontramos|0 produtos? encontrad/i.test(bodyText);
 var withImg=items.filter(function(x){return x.img;}).length;
-return JSON.stringify({items:items,withImg:withImg,cep:m?m[0]:'',url:location.href,title:document.title,noRes:noRes,links:links.length});
+return JSON.stringify({items:items,withImg:withImg,sample:sample,cep:m?m[0]:'',url:location.href,title:document.title,noRes:noRes,links:links.length});
 }catch(e){
 return JSON.stringify({items:[],err:String(e),title:'',url:'',cep:''});
 }
@@ -465,6 +502,7 @@ class ScrapeResult {
   final bool noRes;
   final int links;
   final int withImg;
+  final String sample;
   const ScrapeResult({
     required this.items,
     this.cep,
@@ -474,6 +512,7 @@ class ScrapeResult {
     this.noRes = false,
     this.links = 0,
     this.withImg = 0,
+    this.sample = '',
   });
 }
 
@@ -568,6 +607,7 @@ class WebScraper {
         noRes: d['noRes'] == true,
         links: (d['links'] as num?)?.toInt() ?? 0,
         withImg: (d['withImg'] as num?)?.toInt() ?? 0,
+        sample: (d['sample'] ?? '').toString(),
       );
     } catch (_) {
       return null;
@@ -690,6 +730,38 @@ class _Fetched {
   _Fetched(this.items, this.cep, this.forced, this.msg);
 }
 
+class StoreLogo extends StatelessWidget {
+  final Store store;
+  final double size;
+  const StoreLogo({super.key, required this.store, this.size = 28});
+
+  @override
+  Widget build(BuildContext context) {
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(size * 0.25),
+      child: Container(
+        width: size,
+        height: size,
+        color: Colors.white,
+        padding: EdgeInsets.all(size * 0.1),
+        child: Image.network(
+          store.logoUrl,
+          fit: BoxFit.contain,
+          errorBuilder: (_, __, ___) => Container(
+            color: store.color,
+            alignment: Alignment.center,
+            child: Text(store.name.substring(0, 1),
+                style: TextStyle(
+                    color: Colors.white,
+                    fontWeight: FontWeight.w700,
+                    fontSize: size * 0.45)),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 void main() => runApp(const App());
 
 class App extends StatelessWidget {
@@ -810,6 +882,9 @@ class _HomePageState extends State<HomePage> {
       cep = r.cep;
       dbg.writeln('WebView: ${r.items.length} itens (${r.withImg} com foto) | '
           'links de produto: ${r.links} | título: ${r.title} | url final: ${r.url}');
+      if (r.items.isNotEmpty && r.withImg == 0 && r.sample.isNotEmpty) {
+        dbg.writeln('HTML do 1º card (sem foto): ${r.sample}');
+      }
       if (r.blocked) {
         forced = Phase.blocked;
         msg = 'Bloqueado pelo site (anti-robô)';
@@ -871,6 +946,33 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> _scan() async {
+    var st = await Permission.camera.status;
+    if (!st.isGranted) st = await Permission.camera.request();
+    if (!st.isGranted) {
+      if (!mounted) return;
+      await showDialog<void>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('Permissão da câmera'),
+          content: Text(
+              'O app precisa da câmera para ler o código de barras (situação atual: ${st.name}). '
+              'Toque em "Abrir configurações", entre em Permissões > Câmera e escolha "Permitir".'),
+          actions: [
+            TextButton(
+                onPressed: () => Navigator.pop(ctx),
+                child: const Text('Cancelar')),
+            FilledButton(
+                onPressed: () {
+                  openAppSettings();
+                  Navigator.pop(ctx);
+                },
+                child: const Text('Abrir configurações')),
+          ],
+        ),
+      );
+      return;
+    }
+    if (!mounted) return;
     final code = await Navigator.of(context)
         .push<String>(MaterialPageRoute(builder: (_) => const ScanPage()));
     if (code == null || !mounted) return;
@@ -1100,8 +1202,15 @@ class _HomePageState extends State<HomePage> {
         avatar = const Icon(Icons.error_outline, size: 16, color: Colors.red);
     }
     return FilterChip(
-      avatar: avatar,
-      label: Text(s.name),
+      avatar: StoreLogo(store: s, size: 20),
+      label: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(s.name),
+          const SizedBox(width: 6),
+          SizedBox(width: 16, height: 16, child: Center(child: avatar)),
+        ],
+      ),
       selected: !_hidden.contains(s.id),
       onSelected: (v) => setState(() {
         if (v) {
@@ -1271,6 +1380,8 @@ class _HomePageState extends State<HomePage> {
         children: [
           Row(
             children: [
+              StoreLogo(store: s, size: 30),
+              const SizedBox(width: 8),
               Container(
                 padding:
                     const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
@@ -1388,11 +1499,18 @@ class _HomePageState extends State<HomePage> {
                         decoration: BoxDecoration(
                             color: it.store.color,
                             borderRadius: BorderRadius.circular(6)),
-                        child: Text(it.store.name,
-                            style: const TextStyle(
-                                color: Colors.white,
-                                fontSize: 11,
-                                fontWeight: FontWeight.w600)),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            StoreLogo(store: it.store, size: 16),
+                            const SizedBox(width: 4),
+                            Text(it.store.name,
+                                style: const TextStyle(
+                                    color: Colors.white,
+                                    fontSize: 11,
+                                    fontWeight: FontWeight.w600)),
+                          ],
+                        ),
                       ),
                     Text(it.name,
                         maxLines: 3,
@@ -1486,6 +1604,36 @@ class _ScanPageState extends State<ScanPage> {
       ),
       body: MobileScanner(
         controller: _c,
+        errorBuilder: (context, error, child) {
+          final msg = error.errorDetails?.message ?? '';
+          return ColoredBox(
+            color: Theme.of(context).scaffoldBackgroundColor,
+            child: Center(
+              child: Padding(
+                padding: const EdgeInsets.all(24),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Icon(Icons.error_outline, size: 48),
+                    const SizedBox(height: 12),
+                    const Text('Não foi possível abrir a câmera',
+                        style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700)),
+                    const SizedBox(height: 8),
+                    SelectableText('Motivo: ${error.errorCode.name} $msg',
+                        textAlign: TextAlign.center),
+                    const SizedBox(height: 16),
+                    FilledButton(
+                        onPressed: () => openAppSettings(),
+                        child: const Text('Abrir configurações do app')),
+                    TextButton(
+                        onPressed: () => _c.start(),
+                        child: const Text('Tentar de novo')),
+                  ],
+                ),
+              ),
+            ),
+          );
+        },
         onDetect: (capture) {
           if (_done) return;
           for (final b in capture.barcodes) {
@@ -1562,7 +1710,7 @@ class _SettingsPageState extends State<SettingsPage> {
           for (final s in kStores)
             Card(
               child: ListTile(
-                leading: CircleAvatar(backgroundColor: s.color),
+                leading: StoreLogo(store: s, size: 40),
                 title: Text(s.name),
                 subtitle: Text(s.id == 'goodbom'
                     ? 'Já fixo na loja de Mogi Mirim'
